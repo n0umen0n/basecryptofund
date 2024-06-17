@@ -56,6 +56,9 @@ contract FundManagement is ERC20Burnable {
 
 // Mapping from investor address to their investments
 mapping(address => Investment[]) public investments;
+// Mapping to track whether a transaction hash has already been used
+mapping(bytes32 => bool) public transactionHashes;
+
 
 
     // Events
@@ -223,7 +226,9 @@ function updateTotalWethValue() private {
         return (holderBalance * getTotalUsdValue()) / totalSupply;
     }
 
-function invest(uint256 ethAmount, address recipient) external onlyOwner {
+function invest(uint256 ethAmount, address recipient, bytes32 trxHash) external onlyOwner {
+    require(!transactionHashes[trxHash], "Transaction already processed");
+    transactionHashes[trxHash] = true;
     require(ethAmount > 0 && address(this).balance >= ethAmount, "Insufficient ETH in contract");
     emit DebugString("ETH received for investment.");
 
@@ -280,7 +285,7 @@ function swapEthForToken(uint256 wethAmount, address tokenOut, uint24 poolFee) p
     emit SwapExecuted(wethAmount, amountOut);
 }
 
-
+/*
 function redeem(uint256 fundTokenAmount) external {
     require(fundTokenAmount > 0, "Cannot redeem 0 tokens");
     require(balanceOf(msg.sender) >= fundTokenAmount, "Insufficient token balance");
@@ -323,7 +328,64 @@ function redeem(uint256 fundTokenAmount) external {
     (bool success, ) = msg.sender.call{value: wethReceived}("");
     require(success, "Failed to send ETH");
 }
+*/
 
+
+function redeem(uint256 usdAmount) external {
+    uint256 userTotalUsdValue = getFundTokenUsdValue(msg.sender);  // Get the current USD value of the user's holdings
+    require(userTotalUsdValue >= usdAmount, "Requested USD amount exceeds holdings");
+
+    uint256 initialWethBalance = IERC20(WETH).balanceOf(address(this));
+
+
+    uint256 userTokenBalance = balanceOf(msg.sender);  // User's current token balance
+
+    // Calculate the percentage of the user's total value they wish to redeem
+    uint256 percentageOfHoldings = (usdAmount * 1e18) / userTotalUsdValue;  // Scaled up for precision
+
+    // Determine the number of tokens that corresponds to
+    uint256 tokensToRedeem = (userTokenBalance * percentageOfHoldings) / 1e18;  // Scale back down
+
+    require(tokensToRedeem > 0, "The amount to redeem is too small.");
+    require(tokensToRedeem <= userTokenBalance, "Insufficient tokens to redeem.");
+
+    require(balanceOf(msg.sender) >= tokensToRedeem, "Insufficient token balance");
+
+
+    _burn(msg.sender, tokensToRedeem);
+
+    // Redeem each allocated token on Uniswap based on their proportion in the total allocations
+    for (uint i = 0; i < allocations.length; i++) {
+        uint256 tokenAmount = IERC20(allocations[i].token).balanceOf(address(this));
+        uint256 tokenAmountToSell = (tokenAmount * tokensToRedeem) / totalSupply();
+
+        // Approve the router to spend the tokens to be sold
+        IERC20(allocations[i].token).approve(address(swapRouter), tokenAmountToSell);
+
+        // Set up swap parameters
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: allocations[i].token,
+            tokenOut: WETH,
+            fee: allocations[i].poolfee,
+            recipient: address(this),
+            amountIn: tokenAmountToSell,
+            amountOutMinimum: 0,  // Consider setting a minimum amount out based on current market conditions
+            sqrtPriceLimitX96: 0  // No price limit
+        });
+
+        // Perform the swap
+        swapRouter.exactInputSingle(params);
+    }
+
+    // Calculate the WETH received from swaps
+    uint256 finalWethBalance = IERC20(WETH).balanceOf(address(this));
+    uint256 wethReceived = finalWethBalance - initialWethBalance;
+
+    // Withdraw only the WETH received from token sales to ETH and send to the user
+    IWETH(WETH).withdraw(wethReceived); 
+    (bool success, ) = msg.sender.call{value: wethReceived}("");
+    require(success, "Failed to send ETH");
+}
 
 function calculateProfitOrLoss(address investor) public view returns (int256) {
     uint256 totalUsdValueNow = getFundTokenUsdValue(investor);

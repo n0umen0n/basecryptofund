@@ -49,9 +49,11 @@ contract FundManagement is ERC20Burnable {
 
     TokenAllocation[] public allocations;
 
-    struct Investment {
+struct Investment {
     uint256 amountInvested;
     uint256 usdValueAtInvestment;
+    uint256 remainingUsdValue;
+    uint256 realizedProfit;
 }
 
 // Mapping from investor address to their investments
@@ -238,11 +240,13 @@ function invest(uint256 ethAmount, address recipient, bytes32 trxHash) external 
 
     uint256 usdValue = (ethAmount * getEthPrice()) / 1e18;
 
-    // Record the investment
-    investments[recipient].push(Investment({
-        amountInvested: ethAmount,
-        usdValueAtInvestment: usdValue
-    }));
+investments[recipient].push(Investment({
+    amountInvested: ethAmount,
+    usdValueAtInvestment: usdValue,
+    remainingUsdValue: usdValue, // Initialize the remaining value to be the same as the invested value at the start
+    realizedProfit: 0 // Initialize realized profit as 0 since this is a new investment
+}));
+
 
     // Update WETH balance
     uint256 wethAmount = ethAmount;
@@ -330,27 +334,38 @@ function redeem(uint256 fundTokenAmount) external {
 }
 */
 
-
+event Redeem(
+    address indexed user,
+    uint256 usdAmount,
+    uint256 userTotalUsdValue,
+    uint256 userTokenBalance,
+    uint256 percentageOfHoldings,
+    uint256 tokensToRedeem
+);
 function redeem(uint256 usdAmount) external {
+    updateTotalWethValue();
     uint256 userTotalUsdValue = getFundTokenUsdValue(msg.sender);  // Get the current USD value of the user's holdings
     require(userTotalUsdValue >= usdAmount, "Requested USD amount exceeds holdings");
 
     uint256 initialWethBalance = IERC20(WETH).balanceOf(address(this));
+    require(usdAmount <= type(uint256).max / 1e18, "usdAmount is too large");
 
 
     uint256 userTokenBalance = balanceOf(msg.sender);  // User's current token balance
 
-    // Calculate the percentage of the user's total value they wish to redeem
-    uint256 percentageOfHoldings = (usdAmount * 1e18) / userTotalUsdValue;  // Scaled up for precision
+    uint256 fraction = usdAmount * 1e18 / userTotalUsdValue; // Scale up to maintain precision
+    uint256 tokensToRedeem = userTokenBalance * fraction / 1e18; // Scale down after multiplication
 
-    // Determine the number of tokens that corresponds to
-    uint256 tokensToRedeem = (userTokenBalance * percentageOfHoldings) / 1e18;  // Scale back down
+    emit Redeem(msg.sender, usdAmount, userTotalUsdValue, userTokenBalance, fraction, tokensToRedeem);
+
 
     require(tokensToRedeem > 0, "The amount to redeem is too small.");
     require(tokensToRedeem <= userTokenBalance, "Insufficient tokens to redeem.");
 
     require(balanceOf(msg.sender) >= tokensToRedeem, "Insufficient token balance");
 
+    // Update investments after burning tokens
+    updateInvestmentsPostRedemption(msg.sender, usdAmount);
 
     _burn(msg.sender, tokensToRedeem);
 
@@ -385,19 +400,49 @@ function redeem(uint256 usdAmount) external {
     IWETH(WETH).withdraw(wethReceived); 
     (bool success, ) = msg.sender.call{value: wethReceived}("");
     require(success, "Failed to send ETH");
+    updateTotalWethValue();
+
 }
 
-function calculateProfitOrLoss(address investor) public view returns (int256) {
-    uint256 totalUsdValueNow = getFundTokenUsdValue(investor);
-    uint256 totalInvestedUsdValue = 0;
+function calculateTotalProfits(address investor) public view returns (uint256 totalProfit, uint256 unrealizedProfit, uint256 realizedProfit) {
+    uint256 totalCurrentValue = getFundTokenUsdValue(investor); // Current market value of investor's holdings
+    uint256 totalInvestedValue = 0;
+    realizedProfit = 0;
 
     for (uint i = 0; i < investments[investor].length; i++) {
-        totalInvestedUsdValue += investments[investor][i].usdValueAtInvestment;
+        Investment memory inv = investments[investor][i];
+        totalInvestedValue += inv.usdValueAtInvestment;
+        realizedProfit += inv.realizedProfit;
     }
 
-    // Calculate profit or loss
-    int256 profitOrLoss = int256(totalUsdValueNow) - int256(totalInvestedUsdValue);
-    return profitOrLoss;
+    // Calculate unrealized profit based on current market value vs. original invested value
+    unrealizedProfit = (totalCurrentValue > totalInvestedValue) ? (totalCurrentValue - totalInvestedValue) : 0;
+    
+    totalProfit = realizedProfit + unrealizedProfit;
+    return (totalProfit, unrealizedProfit, realizedProfit);
+}
+
+
+// Adjust investment post-redemption to track realized profits
+function updateInvestmentsPostRedemption(address investor, uint256 usdAmount) private {
+    uint256 totalValueBefore = getFundTokenUsdValue(investor);
+    for (uint i = 0; i < investments[investor].length; i++) {
+        Investment storage inv = investments[investor][i];
+        uint256 proportionalReduction = (inv.remainingUsdValue * usdAmount) / totalValueBefore;
+        if(proportionalReduction < inv.remainingUsdValue) {
+            inv.remainingUsdValue -= proportionalReduction;
+            // Calculate realized profit if the current market value is higher than the investment value
+            uint256 currentInvestmentValue = (inv.remainingUsdValue * getEthPrice()) / inv.usdValueAtInvestment;
+            if(currentInvestmentValue > inv.usdValueAtInvestment) {
+                inv.realizedProfit += currentInvestmentValue - inv.usdValueAtInvestment;
+                inv.usdValueAtInvestment = currentInvestmentValue;
+            }
+        } else {
+            // Full redemption, realize all remaining value as profit or loss
+            inv.realizedProfit += (inv.remainingUsdValue - inv.usdValueAtInvestment);
+            inv.remainingUsdValue = 0;
+        }
+    }
 }
 
 
